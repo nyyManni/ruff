@@ -9618,7 +9618,10 @@ from .<CURSOR>
 ",
             )
             .completion_test_builder();
-        assert_snapshot!(builder.build().snapshot(), @"import");
+        assert_snapshot!(builder.build().snapshot(), @"
+        import
+        bar
+        ");
     }
 
     #[test]
@@ -9683,7 +9686,10 @@ from .imp<CURSOR>
             .source("package/foo.py", "")
             .source("package/sub1/sub2/bar.py", "from.<CURSOR>")
             .completion_test_builder();
-        assert_snapshot!(builder.build().snapshot(), @"import");
+        assert_snapshot!(builder.build().snapshot(), @"
+        import
+        bar
+        ");
     }
 
     #[test]

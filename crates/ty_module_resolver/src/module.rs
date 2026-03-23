@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::debug_assert_matches;
 use std::fmt::Formatter;
 use std::str::FromStr;
@@ -12,6 +13,7 @@ use salsa::plumbing::AsId;
 
 use crate::module_name::ModuleName;
 use crate::path::{SearchPath, SystemOrVendoredPathRef};
+use crate::resolve::{ModuleResolveMode, search_paths};
 use crate::{Db, ResolverEnvironment};
 
 /// Representation of a Python module.
@@ -133,8 +135,11 @@ impl<'db> Module<'db> {
 
     /// Return a list of all submodules of this module.
     ///
-    /// Returns an empty list if the module is not a package, if it is an empty package,
-    /// or if it is a namespace package (one without an `__init__.py` or `__init__.pyi` file).
+    /// Returns an empty list if the module is not a package or if it is an empty package.
+    ///
+    /// For namespace packages (those without an `__init__.py` or `__init__.pyi` file),
+    /// this scans all search paths for directories matching the namespace package's
+    /// module name and collects submodules from each.
     ///
     /// The names returned correspond to the "base" name of the module.
     /// That is, `{self.name}.{basename}` should give the full module name.
@@ -163,6 +168,27 @@ fn all_submodule_names_for_package<'db>(
     db: &'db dyn Db,
     module: Module<'db>,
 ) -> Option<Box<[Module<'db>]>> {
+    // It would be complex and expensive to compute all submodules for
+    // namespace packages, since a namespace package doesn't correspond
+    // to a single file; it can span multiple directories across multiple
+    // search paths. We iterate over all search paths and scan each
+    // matching directory, merging the results.
+    match module {
+        Module::File(file_module) => {
+            if !matches!(file_module.kind(db), ModuleKind::Package) {
+                return None;
+            }
+            submodules_for_file_module(db, file_module)
+        }
+        Module::Namespace(ns_package) => submodules_for_namespace_package(db, ns_package),
+    }
+}
+
+/// Compute submodules for a traditional file-backed package (has `__init__.py`/`__init__.pyi`).
+fn submodules_for_file_module<'db>(
+    db: &'db dyn Db,
+    module: FileModule<'db>,
+) -> Option<Box<[Module<'db>]>> {
     fn is_submodule(
         is_dir: bool,
         is_file: bool,
@@ -190,18 +216,6 @@ fn all_submodule_names_for_package<'db>(
         vendored_path_to_file(db, dir.join("__init__.pyi"))
             .or_else(|_| vendored_path_to_file(db, dir.join("__init__.py")))
             .ok()
-    }
-
-    // It would be complex and expensive to compute all submodules for
-    // namespace packages, since a namespace package doesn't correspond
-    // to a single file; it can span multiple directories across multiple
-    // search paths. For now, we only compute submodules for traditional
-    // packages that exist in a single directory on a single search path.
-    let Module::File(module) = module else {
-        return None;
-    };
-    if !matches!(module.kind(db), ModuleKind::Package) {
-        return None;
     }
 
     let path = SystemOrVendoredPathRef::try_from_file(db, module.file(db))?;
@@ -290,6 +304,171 @@ fn all_submodule_names_for_package<'db>(
             })
             .collect(),
     })
+}
+
+/// Compute submodules for a namespace package by scanning all search paths.
+///
+/// A namespace package can span multiple directories across multiple search paths.
+/// We iterate over every non-stdlib search path, check if the directory corresponding
+/// to the namespace package's module name exists, and collect submodules from all
+/// matching directories. Results are deduplicated by module name, with regular
+/// packages/modules taking priority over namespace packages (matching Python's
+/// import resolution semantics).
+fn submodules_for_namespace_package<'db>(
+    db: &'db dyn Db,
+    ns_package: NamespacePackage<'db>,
+) -> Option<Box<[Module<'db>]>> {
+    fn is_submodule(
+        is_dir: bool,
+        is_file: bool,
+        basename: Option<&str>,
+        extension: Option<&str>,
+    ) -> bool {
+        is_dir
+            || (is_file
+                && matches!(extension, Some("py" | "pyi"))
+                && !matches!(basename, Some("__init__.py" | "__init__.pyi")))
+    }
+
+    fn find_package_init_system(db: &dyn Db, dir: &SystemPath) -> Option<File> {
+        let listing = directory_listing(db, dir).ok()?;
+        if listing.entry_is_file(db, dir, "__init__.pyi") {
+            system_path_to_file(db, dir.join("__init__.pyi")).ok()
+        } else if listing.entry_is_file(db, dir, "__init__.py") {
+            system_path_to_file(db, dir.join("__init__.py")).ok()
+        } else {
+            None
+        }
+    }
+
+    let module_name = ns_package.name(db);
+    let resolver_environment = ns_package.resolver_environment(db);
+
+    // Build the relative directory path from the module name.
+    // e.g. "google.cloud" -> "google/cloud"
+    let relative_dir: String = module_name.as_str().replace('.', "/");
+
+    // Collect submodules across all search paths, deduplicating by name.
+    // Regular (file-backed) modules take priority over namespace packages.
+    let mut submodules: BTreeMap<ModuleName, Module<'db>> = BTreeMap::new();
+
+    for search_path in search_paths(db, resolver_environment, ModuleResolveMode::Typing) {
+        // Namespace packages don't exist in the standard library
+        if search_path.is_standard_library() {
+            continue;
+        }
+
+        let Some(system_path) = search_path.as_system_path() else {
+            continue;
+        };
+
+        let dir_path = system_path.join(&relative_dir);
+
+        // `directory_listing` is a Salsa-tracked query that registers a
+        // dependency on this directory, so our cache is invalidated when
+        // the directory changes.
+        let Ok(listing) = directory_listing(db, &dir_path) else {
+            continue;
+        };
+
+        for (name, ty) in listing.iter() {
+            let relative = SystemPath::new(name);
+
+            if !is_submodule(
+                ty.is_directory(),
+                ty.is_file(),
+                relative.file_name(),
+                relative.extension(),
+            ) {
+                continue;
+            }
+
+            let Some(stem) = relative.file_stem() else {
+                continue;
+            };
+            let Some(stem_name) = ModuleName::new(stem) else {
+                continue;
+            };
+            let entry_path = dir_path.join(relative);
+            let mut full_name = module_name.clone();
+            full_name.extend(&stem_name);
+
+            if ty.is_directory() {
+                if let Some(init_file) = find_package_init_system(db, &entry_path) {
+                    // This is a regular package. It takes priority over namespace
+                    // packages, but should not override a file-backed module from
+                    // a higher-priority search path.
+                    match submodules.entry(full_name.clone()) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(Module::file_module(
+                                db,
+                                init_file,
+                                resolver_environment,
+                                Cow::Owned(full_name),
+                                ModuleKind::Package,
+                                search_path.clone(),
+                            ));
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            // Only override if the existing entry is a namespace package
+                            if matches!(entry.get(), Module::Namespace(_)) {
+                                entry.insert(Module::file_module(
+                                    db,
+                                    init_file,
+                                    resolver_environment,
+                                    Cow::Owned(full_name),
+                                    ModuleKind::Package,
+                                    search_path.clone(),
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    // This is a (nested) namespace package - only add if not already present
+                    submodules.entry(full_name.clone()).or_insert_with(|| {
+                        Module::namespace_package(db, resolver_environment, Cow::Owned(full_name))
+                    });
+                }
+            } else {
+                let Ok(file) = system_path_to_file(db, &entry_path) else {
+                    continue;
+                };
+                // File modules take priority over namespace packages,
+                // but should not override a file-backed module from a
+                // higher-priority search path.
+                match submodules.entry(full_name.clone()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(Module::file_module(
+                            db,
+                            file,
+                            resolver_environment,
+                            Cow::Owned(full_name),
+                            ModuleKind::Module,
+                            search_path.clone(),
+                        ));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        if matches!(entry.get(), Module::Namespace(_)) {
+                            entry.insert(Module::file_module(
+                                db,
+                                file,
+                                resolver_environment,
+                                Cow::Owned(full_name),
+                                ModuleKind::Module,
+                                search_path.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if submodules.is_empty() {
+        return None;
+    }
+
+    Some(submodules.into_values().collect())
 }
 
 /// A module that resolves to a file (`lib.py` or `package/__init__.py`).
